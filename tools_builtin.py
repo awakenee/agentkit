@@ -2,14 +2,62 @@
 
 import ast
 import datetime
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
+import urllib.parse
+import urllib.request
 
 
-def build_tools(registry, memory, workdir="./workspace"):
+def resolve_within(workdir, path):
+    """Absolute path inside `workdir`, or ValueError if it escapes.
+
+    Guards both absolute paths (/etc/passwd) and traversal (../../secrets).
+    """
+    root = os.path.realpath(workdir)
+    candidate = path if os.path.isabs(path) else os.path.join(root, path)
+    full = os.path.realpath(candidate)
+    if full != root and not full.startswith(root + os.sep):
+        raise ValueError(f"path escapes the workspace: {path}")
+    return full
+
+
+def check_public_url(url):
+    """Allow http(s) to public hosts only. Blocks SSRF to localhost/cloud metadata."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("only http:// and https:// URLs are allowed")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host")
+    default_port = 443 if parsed.scheme == "https" else 80
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or default_port,
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError(f"cannot resolve {host}: {e}") from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            raise ValueError(f"blocked non-public address: {ip}")
+    return url
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect hop, so a public URL cannot bounce to 169.254.x.x."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_tools(registry, memory, workdir="./workspace", allow_network=True):
     os.makedirs(workdir, exist_ok=True)
+    opener = urllib.request.build_opener(_GuardedRedirect)
 
     @registry.tool(
         name="remember",
@@ -63,6 +111,8 @@ def build_tools(registry, memory, workdir="./workspace"):
               ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.FloorDiv,
               ast.Mod, ast.USub, ast.UAdd)
         try:
+            if len(expression) > 400:
+                raise ValueError("expression too long")
             node = ast.parse(expression, mode="eval")
             for n in ast.walk(node):
                 if not isinstance(n, OK):
@@ -71,7 +121,21 @@ def build_tools(registry, memory, workdir="./workspace"):
                     raise ValueError("only numbers allowed")
                 if isinstance(n, ast.Call) and getattr(n.func, "id", "") not in allowed:
                     raise ValueError("function not allowed")
-            return str(eval(compile(node, "<calc>", "eval"), {"__builtins__": {}}, allowed))
+                if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Pow):
+                    # Stop `9**9**9**9`: exponent must be a small literal,
+                    # and the result must stay small enough to compute.
+                    exp = n.right
+                    if not isinstance(exp, ast.Constant) or not isinstance(exp.value, (int, float)):
+                        raise ValueError("exponent must be a literal number")
+                    if abs(exp.value) > 512:
+                        raise ValueError("exponent too large")
+                    if isinstance(n.left, ast.Constant) and isinstance(n.left.value, (int, float)):
+                        if n.left.value not in (0, 1, -1) and abs(exp.value) * math.log10(abs(n.left.value)) > 5000:
+                            raise ValueError("result would be too large")
+            result = eval(compile(node, "<calc>", "eval"), {"__builtins__": {}}, allowed)
+            if isinstance(result, (int, float)) and abs(result) == float("inf"):
+                raise ValueError("result too large")
+            return str(result)
         except Exception as e:
             return f"Calc error: {e}"
 
@@ -80,10 +144,14 @@ def build_tools(registry, memory, workdir="./workspace"):
         description="Read a text file from the workspace.",
         parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
     def read_file(path):
-        full = path if os.path.isabs(path) else os.path.join(workdir, path)
+        try:
+            full = resolve_within(workdir, path)
+        except ValueError as e:
+            return f"Error: {e}"
         if not os.path.exists(full):
-            return f"No such file: {full}"
-        return open(full, encoding="utf-8", errors="replace").read()[:20000]
+            return f"No such file: {path}"
+        with open(full, encoding="utf-8", errors="replace") as f:
+            return f.read(20000)
 
     @registry.tool(
         name="write_file",
@@ -92,11 +160,14 @@ def build_tools(registry, memory, workdir="./workspace"):
                     "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                     "required": ["path", "content"]})
     def write_file(path, content):
-        full = path if os.path.isabs(path) else os.path.join(workdir, path)
+        try:
+            full = resolve_within(workdir, path)
+        except ValueError as e:
+            return f"Error: {e}"
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Wrote {len(content)} chars to {full}"
+        return f"Wrote {len(content)} chars to {os.path.relpath(full, os.path.realpath(workdir))}"
 
     @registry.tool(
         name="list_files",
@@ -104,20 +175,25 @@ def build_tools(registry, memory, workdir="./workspace"):
         parameters={"type": "object", "properties": {}})
     def list_files():
         out = []
-        for root, _, files in os.walk(workdir):
-            for fn in files:
+        for root, dirs, files in os.walk(workdir):
+            dirs[:] = [d for d in sorted(dirs) if d != "__pycache__"]
+            for fn in sorted(files):
                 out.append(os.path.relpath(os.path.join(root, fn), workdir))
+                if len(out) >= 500:
+                    return "\n".join(out) + "\n... (truncated)"
         return "\n".join(out) or "(empty workspace)"
 
     @registry.tool(
         name="http_get",
-        description="Fetch a URL and return the first part of the response body.",
+        description="Fetch a public http(s) URL and return the first part of the response body.",
         parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]})
     def http_get(url):
-        import urllib.request
+        if not allow_network:
+            return "Network access is disabled for this agent (AGENT_ALLOW_NETWORK=0)."
         try:
+            check_public_url(url)
             req = urllib.request.Request(url, headers={"User-Agent": "AgentKit/1.0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with opener.open(req, timeout=20) as r:
                 body = r.read(20000).decode("utf-8", "replace")
             body = re.sub(r"<script.*?</script>|<style.*?</style>", " ", body, flags=re.S)
             body = re.sub(r"<[^>]+>", " ", body)

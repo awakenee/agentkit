@@ -1,0 +1,37 @@
+# Fly.io config. Deploy with:  fly launch --no-deploy --copy-config
+# then:  fly volumes create agentkit_data --size 1
+# then:  fly secrets set TELEGRAM_BOT_TOKEN=... OPENAI_API_KEY=... AGENT_ALLOWED_USERS=...
+# then:  fly deploy
+app = "agentkit-telegram"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENT_MEMORY_DIR = "/data/memory"
+  AGENT_WORKDIR = "/data/workspace"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # The poller must stay up: never scale to zero, or the bot silently goes deaf.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/health"
+
+[[mounts]]
+  source = "agentkit_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

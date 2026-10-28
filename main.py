@@ -9,9 +9,12 @@ from tools_builtin import build_tools
 def main():
     memory = Memory(path=os.environ.get("AGENT_MEMORY_DIR", "memory"))
     registry = ToolRegistry()
-    build_tools(registry, memory, workdir=os.environ.get("AGENT_WORKDIR", "workspace"))
+    build_tools(registry, memory,
+                workdir=os.environ.get("AGENT_WORKDIR", "workspace"),
+                allow_network=os.environ.get("AGENT_ALLOW_NETWORK", "1") != "0")
     agent = Agent(name=os.environ.get("AGENT_NAME", "AgentKit"), llm=LLM(),
-                  memory=memory, registry=registry)
+                  memory=memory, registry=registry,
+                  extra=os.environ.get("AGENT_SYSTEM", ""))
     if len(sys.argv) > 1:
         print(agent.run(" ".join(sys.argv[1:])))
         return
