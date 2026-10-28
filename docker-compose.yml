@@ -1,0 +1,12 @@
+services:
+  agentkit:
+    build: .
+    container_name: agentkit
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - agentkit-data:/data
+
+volumes:
+  agentkit-data:

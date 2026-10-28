@@ -30,6 +30,7 @@ Each Telegram user gets isolated memory under `memory/users/<id>/`.
   `now`, `calculate`, `read_file`, `write_file`, `list_files`, `http_get`.
 - `main.py` - CLI front-end.
 - `bot.py` - Telegram front-end (python-telegram-bot v20+).
+- `tests/` - smoke tests, no API keys needed.
 
 ## Add your own tool
 
@@ -66,8 +67,42 @@ export AGENT_NAME="Aria"
 export AGENT_SYSTEM="Be concise. Use British English. Never use emoji."
 ```
 
+## Deploy with Docker
+
+```bash
+cp .env.example .env     # then fill in the keys
+docker compose up -d --build
+docker compose logs -f
+```
+
+The bot polls Telegram and stores memory in a named volume (`agentkit-data`), so
+facts survive container restarts and redeploys.
+
+### Environment variables
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather | (required) |
+| `OPENAI_API_KEY` | Model API key | (required) |
+| `OPENAI_BASE_URL` | Any OpenAI-compatible endpoint | `https://api.openai.com/v1` |
+| `AGENT_MODEL` | Model id | `gpt-4o-mini` |
+| `AGENT_NAME` | Agent's display name | `AgentKit` |
+| `AGENT_SYSTEM` | Extra personality/system rules | (empty) |
+| `AGENT_MEMORY_DIR` | Where facts + history live | `memory` |
+| `AGENT_WORKDIR` | Where file tools read/write | `workspace` |
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and on every pull request:
+it byte-compiles all modules and runs the smoke tests in `tests/`. No API keys
+needed - the tests use a scripted fake model.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Notes
 
 - Memory is plain JSON/JSONL on disk, so run it on a persistent host (VPS, container).
 - The bot uses long-polling; give it a container restart policy.
-- Never commit API keys - `.gitignore` already excludes `.env` and `memory/`.
+- Never commit API keys - `.gitignore` and `.dockerignore` already exclude `.env` and `memory/`.
