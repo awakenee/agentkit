@@ -45,10 +45,15 @@ class ToolRegistry:
     def get(self, name):
         return self._tools.get(name)
 
+    def all(self):
+        """Every registered tool, in registration order."""
+        return list(self._tools.values())
+
     def schemas(self):
         return [t.schema() for t in self._tools.values()]
 
-    def call(self, name, args):
+    def call(self, name, args=None):
+        args = args or {}
         t = self.get(name)
         if not t:
             return f"Error: no tool named '{name}'."
@@ -77,7 +82,8 @@ class Memory:
         self._facts = {}
         if os.path.exists(self.facts_path):
             try:
-                self._facts = json.load(open(self.facts_path, encoding="utf-8"))
+                with open(self.facts_path, encoding="utf-8") as f:
+                    self._facts = json.load(f)
             except Exception:
                 self._facts = {}
 
@@ -100,8 +106,13 @@ class Memory:
         return {k: v for k, v in self._facts.items() if q in k.lower() or q in str(v).lower()}
 
     def _save_facts(self):
-        with open(self.facts_path, "w", encoding="utf-8") as f:
+        # Write-then-rename so a crash mid-write cannot truncate stored facts.
+        tmp = self.facts_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self._facts, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.facts_path)
 
     def add(self, role, content, **meta):
         rec = {"id": uuid.uuid4().hex[:8], "ts": time.time(), "role": role, "content": content}
@@ -110,15 +121,31 @@ class Memory:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def recent(self, n=20):
+        return self._rows()[-n:]
+
+    def _rows(self):
         if not os.path.exists(self.hist_path):
             return []
-        rows = [json.loads(l) for l in open(self.hist_path, encoding="utf-8") if l.strip()]
-        return rows[-n:]
+        rows = []
+        with open(self.hist_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue  # skip a half-written line instead of losing the chat
+        return rows
+
+    def clear(self):
+        """Delete conversation history, keep long-term facts."""
+        with open(self.hist_path, "w", encoding="utf-8") as f:
+            f.truncate(0)
+        return "Conversation history cleared."
 
     def search_history(self, query, n=10):
-        rows = [json.loads(l) for l in open(self.hist_path, encoding="utf-8") if l.strip()] \
-            if os.path.exists(self.hist_path) else []
-        hits = [r for r in rows if query.lower() in str(r.get("content", "")).lower()]
+        hits = [r for r in self._rows() if query.lower() in str(r.get("content", "")).lower()]
         return hits[-n:]
 
     def summary(self):
@@ -138,18 +165,43 @@ class LLM:
     def chat(self, messages, tools=None):
         if not self.api_key:
             raise RuntimeError("Set OPENAI_API_KEY (or pass api_key) before running the agent.")
+        import urllib.error
         import urllib.request
         payload = {"model": self.model, "messages": messages, "temperature": self.temperature}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.loads(r.read().decode("utf-8"))
+        data = json.dumps(payload).encode("utf-8")
+        last_err = None
+        for attempt in range(3):
+            req = urllib.request.Request(
+                self.base_url + "/chat/completions", data=data,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+                method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    return json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", "replace")[:500]
+                last_err = RuntimeError(f"HTTP {e.code} from model endpoint: {body}")
+                if e.code != 429 and e.code < 500:
+                    raise last_err from None  # a bad key or bad request will not fix itself
+            except (urllib.error.URLError, TimeoutError) as e:
+                last_err = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        raise last_err
+
+
+def fill(template, **values):
+    """Replace only the placeholders we know about.
+
+    str.format() would raise KeyError on any stray brace in a user-supplied
+    system prompt (a JSON snippet, say), so substitution is literal instead.
+    """
+    for key, value in values.items():
+        template = template.replace("{" + key + "}", str(value))
+    return template
 
 
 SYSTEM_TEMPLATE = """You are {name}, a capable AI agent with tools and memory.
@@ -164,24 +216,27 @@ Rules:
 - Use a tool whenever the answer depends on real data, files, or a calculation.
 - Call one tool at a time, read its result, then decide the next step.
 - Keep answers concise and concrete. No filler, no restating the question.
+{extra}
 """
 
 
 class Agent:
     def __init__(self, name="AgentKit", system=None, llm=None, memory=None,
-                 registry=None, max_steps=8):
+                 registry=None, max_steps=8, extra=""):
         self.name = name
         self.registry = registry or ToolRegistry()
         self.memory = memory or Memory()
         self.llm = llm or LLM()
         self.max_steps = max_steps
         self.system = system or SYSTEM_TEMPLATE
+        self.extra = extra
 
     def _system_prompt(self):
         tools = "\n".join(
             f"- {t.name}: {t.description} (params: {json.dumps(t.parameters.get('properties', {}), ensure_ascii=False)[:300]})"
-            for t in self.registry._tools.values()) or "(none)"
-        return self.system.format(name=self.name, tool_list=tools, memory=self.memory.summary())
+            for t in self.registry.all()) or "(none)"
+        return fill(self.system, name=self.name, tool_list=tools,
+                    memory=self.memory.summary(), extra=self.extra)
 
     def _messages(self, user_input):
         msgs = [{"role": "system", "content": self._system_prompt()}]
@@ -191,8 +246,10 @@ class Agent:
         return msgs
 
     def run(self, user_input):
-        self.memory.add("user", user_input)
+        # Build first, then record: recording first would replay the same
+        # message twice (once from history, once as the trailing user turn).
         msgs = self._messages(user_input)
+        self.memory.add("user", user_input)
         for _ in range(self.max_steps):
             try:
                 resp = self.llm.chat(msgs, tools=self.registry.schemas() or None)

@@ -23,6 +23,12 @@ python bot.py
 Talk to it on Telegram. Commands: `/start`, `/help`, `/facts`, `/forget <key>`, `/reset`.
 Each Telegram user gets isolated memory under `memory/users/<id>/`.
 
+Before deploying, check your configuration without contacting anything:
+
+```bash
+python bot.py --check
+```
+
 ## What is inside
 
 - `agent.py` - `ToolRegistry`, `Memory`, `LLM`, `Agent` (the loop).
@@ -76,7 +82,17 @@ docker compose logs -f
 ```
 
 The bot polls Telegram and stores memory in a named volume (`agentkit-data`), so
-facts survive container restarts and redeploys.
+facts survive container restarts and redeploys. It also serves `GET /health` on
+`$PORT` (default 8080), which is what makes it deployable to a PaaS.
+
+## Deploy to a PaaS (Render / Railway / Fly)
+
+`render.yaml`, `railway.json` and `fly.toml` are included, and the container
+publishes a `/health` endpoint so platforms can verify the long-polling bot.
+See **[DEPLOY.md](DEPLOY.md)** for step-by-step setup, costs, verification and a
+troubleshooting table. Short version: a poller cannot sleep, so the $5-7/mo
+always-on instance is the realistic minimum. The free tiers all suspend idle
+services.
 
 ### Environment variables
 
@@ -90,6 +106,9 @@ facts survive container restarts and redeploys.
 | `AGENT_SYSTEM` | Extra personality/system rules | (empty) |
 | `AGENT_MEMORY_DIR` | Where facts + history live | `memory` |
 | `AGENT_WORKDIR` | Where file tools read/write | `workspace` |
+| `AGENT_ALLOWED_USERS` | Comma-separated Telegram ids allowed to use the bot | (everyone) |
+| `AGENT_ALLOW_NETWORK` | `0` disables the `http_get` tool | `1` |
+| `PORT` | Enables `GET /health` for PaaS health checks | (off) |
 
 ## Continuous integration
 

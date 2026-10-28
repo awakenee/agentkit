@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: agentkit-telegram
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Free instances sleep after 15 min idle and stop polling Telegram.
+    # `starter` ($7/mo) is the cheapest always-on instance.
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AGENT_ALLOWED_USERS
+        sync: false
+      - key: AGENT_MODEL
+        value: gpt-4o-mini
+      - key: AGENT_NAME
+        value: AgentKit
+      - key: PORT
+        value: "8080"
+    disk:
+      name: agentkit-data
+      mountPath: /data
+      sizeGB: 1
